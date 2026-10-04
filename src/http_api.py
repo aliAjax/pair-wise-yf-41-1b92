@@ -138,6 +138,20 @@ def create_handler(service, rules, static_dir):
                         200,
                         service.transition(actor, parts[2], parts[3], self._body(), None),
                     )
+                if len(parts) == 3 and parts == ["api", "receipts", "reconcile"]:
+                    body = self._body()
+                    event_id = body.pop("event_id", None)
+                    if not event_id:
+                        raise ValidationError("event_id is required")
+                    return self._send(
+                        200,
+                        service.reconcile_receipt(actor, event_id, body),
+                    )
+                if len(parts) == 4 and parts[0] == "api" and parts[1] == "receipts" and parts[3] == "retry":
+                    return self._send(
+                        200,
+                        service.retry_receipt(actor, parts[2]),
+                    )
                 if len(parts) == 2 and parts[0] == "api":
                     body = self._body()
                     idem = self.headers.get("Idempotency-Key")

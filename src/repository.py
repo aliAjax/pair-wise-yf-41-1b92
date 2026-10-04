@@ -1,6 +1,7 @@
 import json
 import sqlite3
 from datetime import datetime, timezone
+from uuid import uuid4
 
 from .domain import ConflictError, NotFoundError
 
@@ -195,6 +196,107 @@ class SQLiteRepository:
                 "VALUES (?, ?, ?, ?)",
                 (actor_id, idem_key, entity_id, utcnow()),
             )
+
+    def find_unpublished_events_with_station(self, station_code):
+        result = []
+        for event in self.list_entities(kind="event"):
+            if event["status"] in ("published", "revised"):
+                continue
+            reports = event["data"].get("reports") or []
+            if any(r.get("station") == station_code for r in reports):
+                result.append(event)
+        return result
+
+    def invalidate_event(self, entity_id, reason, station_statuses=None):
+        now = utcnow()
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM entities WHERE id = ?", (entity_id,)
+            ).fetchone()
+            if not row:
+                raise NotFoundError("entity not found: " + entity_id)
+            if row["status"] in ("published", "revised"):
+                connection.rollback()
+                return self._entity_from_row(row)
+            data = json.loads(row["data"])
+            reports = data.get("reports") or []
+            if not data.get("baseline"):
+                data["baseline"] = {
+                    "reports": reports,
+                    "station_statuses": station_statuses or {},
+                }
+            for key in ("associated_count", "reviewer", "magnitude"):
+                data.pop(key, None)
+            data["invalidated_at"] = now
+            data["invalidation_reason"] = reason
+            payload = json.dumps(data, ensure_ascii=False, sort_keys=True)
+            connection.execute(
+                "UPDATE entities SET status = 'candidate', version = version + 1, data = ?, updated_at = ? "
+                "WHERE id = ?",
+                (payload, now, entity_id),
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        return self.get_entity(entity_id)
+
+    def publish_with_receipt(self, entity_id, expected_version, patch, communication_id, actor_id, receipt_id=None):
+        now = utcnow()
+        receipt_id = receipt_id or str(uuid4())
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM entities WHERE id = ?", (entity_id,)
+            ).fetchone()
+            if not row:
+                raise NotFoundError("entity not found: " + entity_id)
+            current_version = int(row["version"])
+            if expected_version is not None and current_version != int(expected_version):
+                raise ConflictError(
+                    "version conflict: expected %s, found %s"
+                    % (expected_version, current_version)
+                )
+            event_data = json.loads(row["data"])
+            event_data.update(patch)
+            event_payload = json.dumps(event_data, ensure_ascii=False, sort_keys=True)
+            connection.execute(
+                "UPDATE entities SET status = 'published', version = version + 1, data = ?, updated_at = ? "
+                "WHERE id = ? AND version = ?",
+                (event_payload, now, entity_id, current_version),
+            )
+            receipt_data = {
+                "event_id": entity_id,
+                "communication_id": communication_id,
+                "magnitude": event_data.get("magnitude"),
+                "reviewer": event_data.get("reviewer"),
+                "published_at": now,
+                "attempts": 0,
+                "last_error": None,
+            }
+            connection.execute(
+                "INSERT INTO entities(id, kind, status, version, data, created_by, created_at, updated_at) "
+                "VALUES (?, 'receipt', 'pending', 1, ?, ?, ?, ?)",
+                (
+                    receipt_id,
+                    json.dumps(receipt_data, ensure_ascii=False, sort_keys=True),
+                    actor_id,
+                    now,
+                    now,
+                ),
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        return self.get_entity(entity_id), self.get_entity(receipt_id)
 
     def ping(self):
         with self._connect() as connection:

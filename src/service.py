@@ -45,6 +45,29 @@ class DomainService:
         next_status, patch = self.rules.validate_transition(
             actor, entity, action, dict(data or {}), self._lookup
         )
+        kind = self.rules.normalize_kind(entity["kind"])
+        if kind == "event" and action == "publish":
+            communication_id = patch.get("communication_id") or (data or {}).get("communication_id")
+            updated, receipt = self.repository.publish_with_receipt(
+                entity_id, expected, patch, communication_id, actor.user_id
+            )
+            self.audit.record(
+                entity_id,
+                actor,
+                action,
+                entity["status"],
+                updated["status"],
+                {"patch": patch},
+            )
+            self.audit.record(
+                receipt["id"],
+                actor,
+                "receipt_created",
+                None,
+                receipt["status"],
+                {"event_id": entity_id, "communication_id": communication_id},
+            )
+            return updated
         merged = dict(entity["data"])
         merged.update(patch)
         updated = self.repository.update_entity(entity_id, expected, next_status, merged)
@@ -56,7 +79,55 @@ class DomainService:
             updated["status"],
             {"patch": patch},
         )
+        if kind == "station" and action in ("offline", "online"):
+            self._invalidate_events_for_station(updated, actor)
         return updated
+
+    def _invalidate_events_for_station(self, station_entity, actor):
+        code = station_entity["data"].get("code")
+        if not code:
+            return
+        events = self.repository.find_unpublished_events_with_station(code)
+        for event in events:
+            reports = event["data"].get("reports") or []
+            codes = {r.get("station") for r in reports if r.get("station")}
+            statuses = {}
+            for station_code in codes:
+                rows = self._lookup("station", "code", station_code)
+                if rows:
+                    statuses[station_code] = rows[0]["status"]
+            updated = self.repository.invalidate_event(
+                event["id"], "station %s status changed" % code, statuses
+            )
+            self.audit.record(
+                event["id"],
+                actor,
+                "invalidate",
+                event["status"],
+                updated["status"],
+                {"reason": "station status changed", "station": code},
+            )
+
+    def reconcile_receipt(self, actor, event_id, data):
+        receipt = self._find_pending_receipt(event_id)
+        return self.transition(actor, receipt["id"], "reconcile", data)
+
+    def retry_receipt(self, actor, event_id):
+        receipt = self._find_pending_receipt(event_id)
+        return self.transition(actor, receipt["id"], "retry", {})
+
+    def _find_pending_receipt(self, event_id):
+        for receipt in self.repository.list_entities(kind="receipt"):
+            if receipt["data"].get("event_id") == event_id and receipt["status"] in ("pending", "failed"):
+                return receipt
+        raise NotFoundError("no pending receipt for event: " + event_id)
+
+    def receipt_queue(self):
+        return [
+            receipt
+            for receipt in self.repository.list_entities(kind="receipt")
+            if receipt["status"] in ("pending", "failed")
+        ]
 
     def get(self, entity_id):
         entity = self.repository.get_entity(entity_id)

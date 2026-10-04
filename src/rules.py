@@ -1,11 +1,20 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from .domain import (
     ConflictError,
     InvalidTransition,
+    NotFoundError,
     PermissionDenied,
     ValidationError,
 )
+
+
+FROZEN_STATUSES = ("published", "revised")
+UNPUBLISHED_STATUSES = ("candidate", "associated", "reviewed")
+
+
+def _utcnow():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 def _validate_station(actor, data, lookup):
@@ -21,11 +30,100 @@ def _validate_event(actor, data, lookup):
         raise ValidationError("event title is required")
 
 
+def _build_baseline(reports, lookup):
+    codes = {
+        report.get("station")
+        for report in reports
+        if report.get("station")
+    }
+    station_statuses = {}
+    for code in codes:
+        rows = lookup("station", "code", code) if lookup else None
+        if rows:
+            station_statuses[code] = rows[0].get("status")
+    return {"reports": list(reports), "station_statuses": station_statuses}
+
+
 def _validate_associate(actor, entity, data, lookup):
     reports = entity["data"].get("reports") or []
     if len(reports) < 2:
         raise ValidationError("two reports are required for association")
-    return {"associated_count": len(reports)}
+    return {
+        "associated_count": len(reports),
+        "baseline": _build_baseline(reports, lookup),
+    }
+
+
+def _validate_review(actor, entity, data, lookup):
+    reports = entity["data"].get("reports") or []
+    return {"baseline": _build_baseline(reports, lookup)}
+
+
+def _validate_publish(actor, entity, data, lookup):
+    reports = entity["data"].get("reports") or []
+    return {"baseline": _build_baseline(reports, lookup)}
+
+
+def _validate_update_reports(actor, entity, data, lookup):
+    reports = data.get("reports") or []
+    if len(reports) < 2:
+        raise ValidationError("event requires at least two station reports")
+    return {
+        "reports": reports,
+        "associated_count": None,
+        "reviewer": None,
+        "magnitude": None,
+        "baseline": _build_baseline(reports, lookup),
+        "invalidated_at": _utcnow(),
+        "invalidation_reason": "report baseline updated",
+    }
+
+
+def _validate_reconcile(actor, entity, data, lookup):
+    stored = entity.get("data", {})
+    event_id = stored.get("event_id")
+    rows = lookup("event", "id", event_id) if lookup else None
+    event = rows[0] if rows else None
+    if not event:
+        raise NotFoundError("event not found for receipt: " + str(event_id))
+    if event.get("status") not in FROZEN_STATUSES:
+        raise ConflictError(
+            "event %s is not published; receipt cannot reconcile" % event_id
+        )
+    if str(data.get("communication_id")) != str(stored.get("communication_id")):
+        raise ConflictError(
+            "communication_id mismatch: receipt %s, local %s"
+            % (data.get("communication_id"), stored.get("communication_id"))
+        )
+    if float(data.get("magnitude")) != float(stored.get("magnitude")):
+        raise ConflictError(
+            "magnitude mismatch: receipt %s, local %s"
+            % (data.get("magnitude"), stored.get("magnitude"))
+        )
+    if float(stored.get("magnitude")) != float(event["data"].get("magnitude")):
+        raise ConflictError("receipt does not match local event record")
+    return {
+        "reconciled_at": _utcnow(),
+        "reconciled_by": actor.user_id,
+        "last_error": None,
+    }
+
+
+def _validate_retry(actor, entity, data, lookup):
+    stored = entity.get("data", {})
+    attempts = int(stored.get("attempts", 0)) + 1
+    return {
+        "attempts": attempts,
+        "last_error": None,
+        "retried_at": _utcnow(),
+    }
+
+
+def _validate_fail(actor, entity, data, lookup):
+    return {
+        "last_error": data.get("error") or data.get("reason") or "delivery failed",
+        "failed_at": _utcnow(),
+    }
 
 
 def associate_reports(reports, max_delta=120, max_distance=3.0):
@@ -50,17 +148,73 @@ def magnitude_median(amplitudes):
 
 
 CUSTOM_CREATE = {'station': _validate_station, 'event': _validate_event}
-CUSTOM_TRANSITIONS = {('event', 'associate'): _validate_associate}
+CUSTOM_TRANSITIONS = {
+    ('event', 'associate'): _validate_associate,
+    ('event', 'review'): _validate_review,
+    ('event', 'publish'): _validate_publish,
+    ('event', 'update_reports'): _validate_update_reports,
+    ('receipt', 'reconcile'): _validate_reconcile,
+    ('receipt', 'retry'): _validate_retry,
+    ('receipt', 'fail'): _validate_fail,
+}
 
 
 class RuleEngine:
-    ALIASES = {'stations': 'station', 'events': 'event'}
-    INITIAL_STATUS = {'station': 'online', 'event': 'candidate'}
-    TRANSITIONS = {'station': {'offline': (('online',), 'offline'), 'online': (('offline',), 'online')}, 'event': {'associate': (('candidate',), 'associated'), 'review': (('associated',), 'reviewed'), 'publish': (('reviewed',), 'published'), 'revise': (('published', 'revised'), 'revised'), 'withdraw': (('published', 'revised'), 'withdrawn')}}
-    CREATE_REQUIRED = {'station': ('code', 'lat', 'lon'), 'event': ('title', 'origin_time', 'location', 'reports')}
-    ACTION_REQUIRED = {('station', 'offline'): ('reason',), ('event', 'review'): ('reviewer', 'magnitude'), ('event', 'publish'): ('communication_id',), ('event', 'revise'): ('reason', 'magnitude'), ('event', 'withdraw'): ('reason',)}
-    CREATE_ROLES = {'station': ('admin', 'station'), 'event': ('admin', 'analyst')}
-    ROLE_ACTIONS = {'offline': ('admin', 'station'), 'online': ('admin', 'station'), 'associate': ('admin', 'analyst'), 'review': ('admin', 'reviewer'), 'publish': ('admin', 'reviewer'), 'revise': ('admin', 'reviewer'), 'withdraw': ('admin', 'reviewer')}
+    ALIASES = {'stations': 'station', 'events': 'event', 'receipts': 'receipt'}
+    INITIAL_STATUS = {'station': 'online', 'event': 'candidate', 'receipt': 'pending'}
+    TRANSITIONS = {
+        'station': {
+            'offline': (('online',), 'offline'),
+            'online': (('offline',), 'online'),
+        },
+        'event': {
+            'associate': (('candidate',), 'associated'),
+            'review': (('associated',), 'reviewed'),
+            'publish': (('reviewed',), 'published'),
+            'revise': (('published', 'revised'), 'revised'),
+            'withdraw': (('published', 'revised'), 'withdrawn'),
+            'update_reports': (UNPUBLISHED_STATUSES, 'candidate'),
+        },
+        'receipt': {
+            'reconcile': (('pending', 'failed'), 'reconciled'),
+            'fail': (('pending',), 'failed'),
+            'retry': (('failed', 'pending'), 'pending'),
+        },
+    }
+    CREATE_REQUIRED = {
+        'station': ('code', 'lat', 'lon'),
+        'event': ('title', 'origin_time', 'location', 'reports'),
+        'receipt': ('event_id', 'communication_id'),
+    }
+    ACTION_REQUIRED = {
+        ('station', 'offline'): ('reason',),
+        ('event', 'review'): ('reviewer', 'magnitude'),
+        ('event', 'publish'): ('communication_id',),
+        ('event', 'revise'): ('reason', 'magnitude'),
+        ('event', 'withdraw'): ('reason',),
+        ('event', 'update_reports'): ('reports',),
+        ('receipt', 'reconcile'): ('communication_id', 'magnitude'),
+        ('receipt', 'fail'): ('error',),
+        ('receipt', 'retry'): (),
+    }
+    CREATE_ROLES = {
+        'station': ('admin', 'station'),
+        'event': ('admin', 'analyst'),
+        'receipt': ('admin', 'reviewer'),
+    }
+    ROLE_ACTIONS = {
+        'offline': ('admin', 'station'),
+        'online': ('admin', 'station'),
+        'associate': ('admin', 'analyst'),
+        'review': ('admin', 'reviewer'),
+        'publish': ('admin', 'reviewer'),
+        'revise': ('admin', 'reviewer'),
+        'withdraw': ('admin', 'reviewer'),
+        'update_reports': ('admin', 'analyst'),
+        'reconcile': ('admin', 'reviewer'),
+        'fail': ('admin', 'reviewer'),
+        'retry': ('admin', 'reviewer'),
+    }
 
     def normalize_kind(self, kind):
         return self.ALIASES.get(kind, kind)
