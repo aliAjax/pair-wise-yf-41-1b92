@@ -24,7 +24,14 @@ python3 app.py --db ./data.db --port 8307
 
 ## 核心对象
 
-- `station`：观测台站；`event`：地震事件及其多个修订版本。
+- `station`：观测台站；`event`：地震事件及其多个修订版本；`dispatch`：发布回执待发单。
+
+## 编目链规则
+
+- 事件修订(`revise`)必须携带`expected_version`：两名编目员同时提交时先写入的生效，后到的返回409冲突。
+- 台站状态变更(`offline`/`online`)或事件报告基线更新(`rebaseline`，仅`associated`/`reviewed`状态可用)后，未发布结论(`reviewed`)失效并回到`associated`待重算，结论字段被清除并标记`conclusion_stale`；已发布版本冻结，发布时快照保存在`published_snapshot`，级联与基线更新均不影响。台站变更与级联失效在同一事务内提交。
+- 新版事件`publish`必须携带`communication_id`，发布同事务生成`dispatch`待发单(`pending`)。回执对账失败时发单留在队列；`retry`沿用原通信编号(传入不同编号返回400)；`reconcile`提交回执，与本地记录(`communication_id`、`event_id`、`event_version`)一致才转为`completed`。队列查询：`GET /api/dispatch?status=pending`。
+- 事件创建时写入`catalog_version`(当前为2)。缺失或小于当前版本的旧事件按首次编目规则兼容：发布不要求通信编号、不生成待发单，修订不强制`expected_version`，不参与结论失效级联。
 
 ## 主要接口
 

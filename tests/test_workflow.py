@@ -32,7 +32,7 @@ class WorkflowTest(unittest.TestCase):
 
     def test_full_workflow(self):
         created = {}
-        steps = [{'op': 'create', 'as': 'station', 'kind': 'station', 'data': {'code': 'STA-1', 'lat': 35.0, 'lon': 110.0}}, {'op': 'create', 'as': 'event', 'kind': 'event', 'data': {'title': 'Event-A', 'origin_time': '2026-01-01T00:00:00Z', 'location': 'Region-A', 'reports': [{'station': 'STA-1', 'time_offset': 2, 'distance_km': 1.0}, {'station': 'STA-2', 'time_offset': -1, 'distance_km': 1.5}]}}, {'op': 'transition', 'target': 'event', 'action': 'associate', 'data': {}, 'expect': 'associated'}, {'op': 'transition', 'target': 'event', 'action': 'review', 'data': {'reviewer': 'R-1', 'magnitude': 4.2}, 'expect': 'reviewed'}, {'op': 'transition', 'target': 'event', 'action': 'publish', 'data': {'communication_id': 'C-1'}, 'expect': 'published'}, {'op': 'transition', 'target': 'event', 'action': 'revise', 'data': {'reason': 'new station data', 'magnitude': 4.3}, 'expect': 'revised'}]
+        steps = [{'op': 'create', 'as': 'station', 'kind': 'station', 'data': {'code': 'STA-1', 'lat': 35.0, 'lon': 110.0}}, {'op': 'create', 'as': 'event', 'kind': 'event', 'data': {'title': 'Event-A', 'origin_time': '2026-01-01T00:00:00Z', 'location': 'Region-A', 'reports': [{'station': 'STA-1', 'time_offset': 2, 'distance_km': 1.0}, {'station': 'STA-2', 'time_offset': -1, 'distance_km': 1.5}]}}, {'op': 'transition', 'target': 'event', 'action': 'associate', 'data': {}, 'expect': 'associated'}, {'op': 'transition', 'target': 'event', 'action': 'review', 'data': {'reviewer': 'R-1', 'magnitude': 4.2}, 'expect': 'reviewed'}, {'op': 'transition', 'target': 'event', 'action': 'publish', 'data': {'communication_id': 'C-1'}, 'expect': 'published'}, {'op': 'transition', 'target': 'event', 'action': 'revise', 'data': {'reason': 'new station data', 'magnitude': 4.3}, 'expected_version': 'current', 'expect': 'revised'}]
         for step in steps:
             if step["op"] == "create":
                 entity = self.service.create(
@@ -43,12 +43,15 @@ class WorkflowTest(unittest.TestCase):
                 )
                 created[step["as"]] = entity["id"]
             else:
+                expected = step.get("expected_version")
+                if expected == "current":
+                    expected = entity["version"]
                 entity = self.service.transition(
                     self.actor,
                     created[step["target"]],
                     step["action"],
                     _resolve(step.get("data", {}), created),
-                    step.get("expected_version"),
+                    expected,
                 )
             if "expect" in step:
                 self.assertEqual(entity["status"], step["expect"])

@@ -7,6 +7,37 @@ from .domain import (
     ValidationError,
 )
 
+CURRENT_CATALOG_VERSION = 2
+CONCLUSION_FIELDS = ("magnitude", "reviewer")
+
+
+def catalog_version_of(entity):
+    """首次编目时写入的规则版本，缺失按旧版(1)处理。"""
+    data = entity.get("data") or {}
+    try:
+        return int(data.get("catalog_version") or 1)
+    except (TypeError, ValueError):
+        return 1
+
+
+def is_legacy_event(entity):
+    return entity.get("kind") == "event" and catalog_version_of(entity) < CURRENT_CATALOG_VERSION
+
+
+def event_references_station(event, station_code):
+    reports = (event.get("data") or {}).get("reports") or []
+    return any(str(report.get("station")) == str(station_code) for report in reports)
+
+
+def invalidate_conclusion(cause, now):
+    """未发布结论失效：返回(合并补丁, 需删除的结论字段)。"""
+    patch = {
+        "conclusion_stale": True,
+        "invalidation_cause": cause,
+        "invalidated_at": now,
+    }
+    return patch, list(CONCLUSION_FIELDS)
+
 
 def _validate_station(actor, data, lookup):
     if not data.get("code"):
@@ -19,6 +50,8 @@ def _validate_event(actor, data, lookup):
         raise ValidationError("event requires at least two station reports")
     if not data.get("title"):
         raise ValidationError("event title is required")
+    data.setdefault("catalog_version", CURRENT_CATALOG_VERSION)
+    data.setdefault("baseline_version", 1)
 
 
 def _validate_associate(actor, entity, data, lookup):
@@ -26,6 +59,60 @@ def _validate_associate(actor, entity, data, lookup):
     if len(reports) < 2:
         raise ValidationError("two reports are required for association")
     return {"associated_count": len(reports)}
+
+
+def _validate_review(actor, entity, data, lookup):
+    return {
+        "conclusion_stale": False,
+        "reviewed_baseline_version": entity["data"].get("baseline_version") or 1,
+    }
+
+
+def _validate_publish(actor, entity, data, lookup):
+    if is_legacy_event(entity):
+        return {"publish_receipt_status": "legacy"}
+    if not data.get("communication_id"):
+        raise ValidationError("missing required field: communication_id")
+    snapshot = {
+        "magnitude": entity["data"].get("magnitude"),
+        "reviewer": entity["data"].get("reviewer"),
+        "reports": entity["data"].get("reports") or [],
+        "baseline_version": entity["data"].get("baseline_version") or 1,
+        "communication_id": data.get("communication_id"),
+        "catalog_version": catalog_version_of(entity),
+    }
+    return {"publish_receipt_status": "pending", "published_snapshot": snapshot}
+
+
+def _validate_rebaseline(actor, entity, data, lookup):
+    reports = data.get("reports") or []
+    if len(reports) < 2:
+        raise ValidationError("event requires at least two station reports")
+    associated = associate_reports(reports)
+    baseline_version = int(entity["data"].get("baseline_version") or 1) + 1
+    return {"associated_count": len(associated), "baseline_version": baseline_version}
+
+
+def _validate_retry(actor, entity, data, lookup):
+    original = entity["data"].get("communication_id")
+    requested = data.get("communication_id")
+    if requested is not None and str(requested) != str(original):
+        raise ValidationError("retry must reuse the original communication_id")
+    attempts = int(entity["data"].get("attempts") or 0) + 1
+    return {"attempts": attempts, "communication_id": original}
+
+
+def _validate_reconcile(actor, entity, data, lookup):
+    receipt = data.get("receipt") or {}
+    record = entity["data"]
+    mismatched = [
+        field
+        for field in ("communication_id", "event_id", "event_version")
+        if str(receipt.get(field)) != str(record.get(field))
+    ]
+    if mismatched:
+        raise ValidationError("receipt does not match local record: " + ", ".join(mismatched))
+    return {"receipt": receipt}
 
 
 def associate_reports(reports, max_delta=120, max_distance=3.0):
@@ -50,17 +137,64 @@ def magnitude_median(amplitudes):
 
 
 CUSTOM_CREATE = {'station': _validate_station, 'event': _validate_event}
-CUSTOM_TRANSITIONS = {('event', 'associate'): _validate_associate}
+CUSTOM_TRANSITIONS = {
+    ('event', 'associate'): _validate_associate,
+    ('event', 'review'): _validate_review,
+    ('event', 'publish'): _validate_publish,
+    ('event', 'rebaseline'): _validate_rebaseline,
+    ('dispatch', 'retry'): _validate_retry,
+    ('dispatch', 'reconcile'): _validate_reconcile,
+}
 
 
 class RuleEngine:
-    ALIASES = {'stations': 'station', 'events': 'event'}
-    INITIAL_STATUS = {'station': 'online', 'event': 'candidate'}
-    TRANSITIONS = {'station': {'offline': (('online',), 'offline'), 'online': (('offline',), 'online')}, 'event': {'associate': (('candidate',), 'associated'), 'review': (('associated',), 'reviewed'), 'publish': (('reviewed',), 'published'), 'revise': (('published', 'revised'), 'revised'), 'withdraw': (('published', 'revised'), 'withdrawn')}}
-    CREATE_REQUIRED = {'station': ('code', 'lat', 'lon'), 'event': ('title', 'origin_time', 'location', 'reports')}
-    ACTION_REQUIRED = {('station', 'offline'): ('reason',), ('event', 'review'): ('reviewer', 'magnitude'), ('event', 'publish'): ('communication_id',), ('event', 'revise'): ('reason', 'magnitude'), ('event', 'withdraw'): ('reason',)}
-    CREATE_ROLES = {'station': ('admin', 'station'), 'event': ('admin', 'analyst')}
-    ROLE_ACTIONS = {'offline': ('admin', 'station'), 'online': ('admin', 'station'), 'associate': ('admin', 'analyst'), 'review': ('admin', 'reviewer'), 'publish': ('admin', 'reviewer'), 'revise': ('admin', 'reviewer'), 'withdraw': ('admin', 'reviewer')}
+    ALIASES = {'stations': 'station', 'events': 'event', 'dispatches': 'dispatch'}
+    INITIAL_STATUS = {'station': 'online', 'event': 'candidate', 'dispatch': 'pending'}
+    TRANSITIONS = {
+        'station': {
+            'offline': (('online',), 'offline'),
+            'online': (('offline',), 'online'),
+        },
+        'event': {
+            'associate': (('candidate',), 'associated'),
+            'review': (('associated',), 'reviewed'),
+            'publish': (('reviewed',), 'published'),
+            'revise': (('published', 'revised'), 'revised'),
+            'withdraw': (('published', 'revised'), 'withdrawn'),
+            'rebaseline': (('associated', 'reviewed'), 'associated'),
+        },
+        'dispatch': {
+            'retry': (('pending',), 'pending'),
+            'reconcile': (('pending',), 'completed'),
+        },
+    }
+    CREATE_REQUIRED = {
+        'station': ('code', 'lat', 'lon'),
+        'event': ('title', 'origin_time', 'location', 'reports'),
+        'dispatch': ('event_id', 'communication_id', 'event_version'),
+    }
+    ACTION_REQUIRED = {
+        ('station', 'offline'): ('reason',),
+        ('event', 'review'): ('reviewer', 'magnitude'),
+        ('event', 'revise'): ('reason', 'magnitude'),
+        ('event', 'withdraw'): ('reason',),
+        ('event', 'rebaseline'): ('reports',),
+        ('dispatch', 'reconcile'): ('receipt',),
+    }
+    CREATE_ROLES = {'station': ('admin', 'station'), 'event': ('admin', 'analyst'), 'dispatch': ('admin', 'reviewer')}
+    ROLE_ACTIONS = {
+        'offline': ('admin', 'station'),
+        'online': ('admin', 'station'),
+        'associate': ('admin', 'analyst'),
+        'review': ('admin', 'reviewer'),
+        'publish': ('admin', 'reviewer'),
+        'revise': ('admin', 'reviewer'),
+        'withdraw': ('admin', 'reviewer'),
+        'rebaseline': ('admin', 'analyst'),
+        'retry': ('admin', 'reviewer'),
+        'reconcile': ('admin', 'reviewer'),
+    }
+    STRICT_EXPECTED_VERSION = {('event', 'revise')}
 
     def normalize_kind(self, kind):
         return self.ALIASES.get(kind, kind)
@@ -70,6 +204,12 @@ class RuleEngine:
         if kind not in self.INITIAL_STATUS:
             raise ValidationError("unknown kind: " + str(kind))
         return self.INITIAL_STATUS[kind]
+
+    def expected_version_required(self, kind, action, entity):
+        kind = self.normalize_kind(kind)
+        if (kind, action) not in self.STRICT_EXPECTED_VERSION:
+            return False
+        return not is_legacy_event(entity)
 
     @staticmethod
     def _ensure_role(actor, allowed):
